@@ -169,7 +169,11 @@ void control_sensor_power(bool on_off)
     }
 }
 
-void start_sensors(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
+// Sets up the SPI bus and prepares the BMV080 (driver open + reset like the
+// SparkFun example, then the measurement parameters). The measurement itself
+// is only started in read_bmv080(), right before it is served.
+// Returns false if the BMV080 could not be prepared.
+bool start_sensors(SparkFunBMV080SPI &bmv080)
 {
 
     pinMode(BMV_CS_PIN, OUTPUT);
@@ -184,11 +188,14 @@ void start_sensors(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    bmv080.begin(BMV_CS_PIN, SPI);
-    bmv080.open();
-    bmv080.reset();
-    bmv080.setMode(SF_BMV080_MODE_CONTINUOUS);
-    // BME690 is started in read_bme690(), only when a reading is due
+    if (!bmv080.begin(BMV_CS_PIN, SPI) || !bmv080.init())
+    {
+        return false;
+    }
+
+    // Parameters must be set before the measurement is started
+    return bmv080.setIntegrationTime(BMV080_INTEGRATION_S) &&
+           bmv080.setMeasurementAlgorithm(BMV080_ALGORITHM);
 }
 
 void read_stcc4()
@@ -217,12 +224,6 @@ void read_rtc(){
     rtc.updateTime();
 }
 
-// The BMV080 outputs a result every second, averaged over its integration
-// time (10 s by default). Results from the first seconds after power-up come
-// from a nearly empty window and read ~0, so keep measuring until an output
-// covers the full window.
-constexpr float BMV080_INTEGRATION_S = 10.0f;
-constexpr uint32_t BMV080_MAX_MEASURE_MS = 15000; // give up if no full-window output
 
 // Time of the last successful BME690 reading (0 = none yet since wake-up)
 static bool bme690HasReading = false;
@@ -275,51 +276,56 @@ void read_bme690(BME690_7semi &bme)
     }
 }
 
-void read_bmv080(SparkFunBMV080SPI &bmv080)
+// The BMV080 outputs a result every second, computed over the last
+// BMV080_INTEGRATION_S seconds. Outputs from the first seconds of a burst
+// cover a partly empty window and read too low, so only the first output that
+// covers the full window is used. Nothing else runs while measuring, so the
+// sensor is served every 100 ms (Bosch: at least once per second).
+void read_bmv080(SparkFunBMV080SPI &bmv080, bool ready)
 {
-    // Sent as "no value" if the BMV080 gives no usable output this cycle
+    // Sent as "no value" unless a full-window, unobstructed output arrives
     ble_pm1 = ble_pm25 = ble_pm10 = NAN;
+
+    if (!ready || !bmv080.setMode(SF_BMV080_MODE_CONTINUOUS))
+    {
+        return;
+    }
 
     const uint32_t startMs = millis();
 
     while (millis() - startMs < BMV080_MAX_MEASURE_MS)
     {
-        // Must be served at least once per second while measuring
         bmv080_output_t out;
-        if (bmv080.readSensor(&out))
+        if (bmv080.readSensor(&out) && out.runtime_in_sec >= BMV080_INTEGRATION_S)
         {
-            if (out.is_obstructed)
-            {
-                ble_pm1 = ble_pm25 = ble_pm10 = NAN;
-            }
-            else
+            if (!out.is_obstructed)
             {
                 ble_pm1 = out.pm1_mass_concentration;
                 ble_pm25 = out.pm2_5_mass_concentration;
                 ble_pm10 = out.pm10_mass_concentration;
             }
-
-            if (out.runtime_in_sec >= BMV080_INTEGRATION_S)
-            {
-                break; // full integration window: final value for this cycle
-            }
+            break;
         }
-
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+
+    // End the measurement before the laser rail is switched off. The SparkFun
+    // wrapper has no stop call; a reset returns the BMV080 to idle.
+    bmv080.reset();
 }
 
-void read_sensors(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
+void read_sensors(SparkFunBMV080SPI &bmv080, bool bmv080Ready, BME690_7semi &bme)
 {
+    // CO2 and BME690 first: both block (STCC4 single shot ~0.5 s), and the
+    // BMV080 must not be left unserved once its measurement has started
     read_stcc4();
 
-    // Before the BMV080 measurement, while the board is still cool
     if (bme690_reading_due())
     {
         read_bme690(bme);
     }
 
-    read_bmv080(bmv080);
+    read_bmv080(bmv080, bmv080Ready);
     read_max();
     read_rtc();
 }
@@ -406,9 +412,9 @@ void run_sensor_cycle()
 
     control_sensor_power(true);
 
-    start_sensors(bmv080, bme);
+    const bool bmv080Ready = start_sensors(bmv080);
 
-    read_sensors(bmv080, bme);
+    read_sensors(bmv080, bmv080Ready, bme);
 
     bmv080.close();
 

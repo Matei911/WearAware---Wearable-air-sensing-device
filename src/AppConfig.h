@@ -31,9 +31,10 @@ esp_pm_lock_handle_t sensorApbLock = nullptr;
 // One read/notify characteristic carrying a whole reading as a packed record
 NimBLECharacteristic *pCharReadings = nullptr;
 
-float ble_pm1 = 0.0;
-float ble_pm25 = 0.0;
-float ble_pm10 = 0.0;
+// NaN = no valid reading -> sent as "no value"
+float ble_pm1 = NAN;
+float ble_pm25 = NAN;
+float ble_pm10 = NAN;
 // NaN until the first BME690 reading -> sent as "no value"
 float ble_temp = NAN;
 float ble_rh = NAN;
@@ -112,6 +113,18 @@ constexpr uint8_t BUTTON_3 = 33;
 
 // Sensor cycle period while a phone is connected
 constexpr uint32_t SENSOR_PERIOD_MS = 60000;
+
+// BMV080: measured in a burst each sensor cycle (laser rail on, measure,
+// laser rail off). The value sent is the first driver output that covers a
+// full integration window; partial-window outputs are not used.
+//   BMV080_INTEGRATION_S : measurement window. Longer = less noise, more power.
+//   BMV080_ALGORITHM     : FAST_RESPONSE is what Bosch's own duty-cycling
+//                          (short on/off bursts) mode uses. HIGH_PRECISION is
+//                          the continuous-mode default and expects the sensor
+//                          to keep running. BALANCED is in between.
+constexpr float BMV080_INTEGRATION_S = 10.0f;
+constexpr uint8_t BMV080_ALGORITHM = E_BMV080_MEASUREMENT_ALGORITHM_FAST_RESPONSE;
+constexpr uint32_t BMV080_MAX_MEASURE_MS = 15000; // give up without a full window
 
 // BME690: read only every 5 minutes to limit self-heating; every sensor cycle
 // in between sends the last temperature / humidity / pressure again
