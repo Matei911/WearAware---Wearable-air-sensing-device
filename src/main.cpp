@@ -1,4 +1,5 @@
 #include "AppConfig.h"
+#include "UserInterface.h"
 #include <math.h>
 
 class MyServerCallbacks : public NimBLEServerCallbacks
@@ -7,12 +8,18 @@ class MyServerCallbacks : public NimBLEServerCallbacks
     {
         deviceConnected = true;
         pServer->updateConnParams(desc->conn_handle, 800, 800, 29, 6000);
+        ui_post_event(UI_EVT_BLE_CHANGED);
     }
 
     void onDisconnect(NimBLEServer *pServer)
     {
         deviceConnected = false;
-        NimBLEDevice::startAdvertising();
+        // Do not advertise again if the user turned Bluetooth off from the device
+        if (!bleUserDisabled)
+        {
+            NimBLEDevice::startAdvertising();
+        }
+        ui_post_event(UI_EVT_BLE_CHANGED);
     }
 };
 
@@ -56,7 +63,7 @@ void init_i2c_one()
 void init_ble_config()
 {
 
-    NimBLEDevice::init("ESP32_S3_LowPower");
+    NimBLEDevice::init(BLE_DEVICE_NAME);
     NimBLEDevice::setPower(ESP_PWR_LVL_N12);
 
     pServer = NimBLEDevice::createServer();
@@ -328,17 +335,37 @@ void setup()
 
     esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "sensor_no_sleep", &sensorNoSleepLock);
     esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "sensor_apb", &sensorApbLock);
+
+    // Screen + buttons. Draws the pairing screen.
+    ui_init();
 }
 
 void loop()
 {
+    static bool cycleDoneThisConnection = false;
+    static uint32_t lastCycleMs = 0;
+
+    // Button presses / BLE changes that arrived meanwhile + screen update
+    ui_process_events();
+
     if (!deviceConnected)
     {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        cycleDoneThisConnection = false;
+        // Light sleep until a button press or BLE connect wakes us
+        ui_wait_for_event(SENSOR_PERIOD_MS);
         return;
     }
 
-    run_sensor_cycle();
+    // First cycle right after connecting, then every SENSOR_PERIOD_MS
+    const uint32_t sinceLast = millis() - lastCycleMs;
+    if (!cycleDoneThisConnection || sinceLast >= SENSOR_PERIOD_MS)
+    {
+        run_sensor_cycle();
+        lastCycleMs = millis();
+        cycleDoneThisConnection = true;
+        return;
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(60000));
+    // Light sleep until the next cycle, or earlier if button 1 is pressed
+    ui_wait_for_event(SENSOR_PERIOD_MS - sinceLast);
 }
