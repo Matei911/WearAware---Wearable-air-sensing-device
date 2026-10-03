@@ -28,14 +28,8 @@ volatile bool bleUserDisabled = false;
 esp_pm_lock_handle_t sensorNoSleepLock = nullptr;
 esp_pm_lock_handle_t sensorApbLock = nullptr;
 
-NimBLECharacteristic *pCharPM1 = nullptr;
-NimBLECharacteristic *pCharPM25 = nullptr;
-NimBLECharacteristic *pCharPM10 = nullptr;
-NimBLECharacteristic *pCharCO2 = nullptr;
-NimBLECharacteristic *pCharTMP = nullptr;
-NimBLECharacteristic *pCharHUM = nullptr;
-NimBLECharacteristic *pCharPRESS = nullptr;
-NimBLECharacteristic *pCharBATT = nullptr;
+// One read/notify characteristic carrying a whole reading as a packed record
+NimBLECharacteristic *pCharReadings = nullptr;
 
 float ble_pm1 = 0.0;
 float ble_pm25 = 0.0;
@@ -46,15 +40,45 @@ float ble_press = 0.0;
 float ble_batt = 0.0;
 int16_t ble_co2 = 0;
 
-#define SERVICE_UUID "0000181a-0000-1000-8000-00805f9b34fc"
-#define UUID_TEMP "00002A6E-0000-1000-8000-00805F9B34FB"
-#define UUID_HUM "00002A6F-0000-1000-8000-00805F9B34FB"
-#define UUID_PRESS "00002A6D-0000-1000-8000-00805F9B34FB"
-#define UUID_CO2 "00002B8C-0000-1000-8000-00805F9B34FB"
-#define UUID_PM1 "00002BD5-0000-1000-8000-00805F9B34FB"
-#define UUID_PM25 "00002BD6-0000-1000-8000-00805F9B34FB"
-#define UUID_PM10 "00002BD7-0000-1000-8000-00805F9B34FB"
-#define UUID_BATTERY "00002A76-0000-1000-8000-00805F9B34FB"
+// BLE: one custom service with ONE read/notify characteristic that carries a
+// whole reading as a packed 20-byte binary record (see reading_packet_t).
+#define SERVICE_UUID "8d3b0000-5c2f-4c38-9a1e-6f1d2b7a0c01"
+#define UUID_READINGS "8d3b0010-5c2f-4c38-9a1e-6f1d2b7a0c01"
+
+// ==================== BLE packet format ====================
+//
+// Little-endian, packed, 20 bytes: fits in one notification even at the
+// default MTU (23 -> 20 payload).
+// Python: struct.unpack('<BIHHHHhHHB', data)
+//
+//  off size field     type    scale  "no value"
+//   0   1   version   uint8   -      (always PACKET_VERSION)
+//   1   4   timestamp uint32  -      0            seconds since 1970-01-01, RTC local time
+//   5   2   pm1       uint16  1      0xFFFF       ug/m3
+//   7   2   pm25      uint16  1      0xFFFF       ug/m3
+//   9   2   pm10      uint16  1      0xFFFF       ug/m3
+//  11   2   co2       uint16  1      0xFFFF       ppm
+//  13   2   temp      int16   x10    0x8000       degC   (382 = 38.2 C)
+//  15   2   hum       uint16  x10    0xFFFF       %RH    (220 = 22.0 %)
+//  17   2   pres      uint16  x10    0xFFFF       hPa    (10126 = 1012.6 hPa)
+//  19   1   battery   uint8   1      0xFF         %
+
+static constexpr uint8_t PACKET_VERSION = 1;
+
+struct __attribute__((packed)) reading_packet_t
+{
+    uint8_t version;
+    uint32_t timestamp;
+    uint16_t pm1, pm25, pm10, co2;
+    int16_t temp;
+    uint16_t hum, pres;
+    uint8_t battery;
+};
+static_assert(sizeof(reading_packet_t) == 20, "BLE packet must stay 20 bytes");
+
+static constexpr uint16_t NO_VALUE_U16 = 0xFFFF;
+static constexpr int16_t NO_VALUE_I16 = INT16_MIN;
+static constexpr uint8_t NO_VALUE_U8 = 0xFF;
 
 // BMV Pins
 constexpr uint8_t BMV_CS_PIN = 36;

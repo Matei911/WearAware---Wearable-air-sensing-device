@@ -1,6 +1,7 @@
 #include "AppConfig.h"
 #include "UserInterface.h"
 #include <math.h>
+#include <driver/rtc_io.h>
 
 class MyServerCallbacks : public NimBLEServerCallbacks
 {
@@ -41,6 +42,53 @@ void init_config_peripherals()
     vTaskDelay(pdMS_TO_TICKS(200));
 }
 
+// Levels kept in deep sleep are latched with GPIO hold; release them once the
+// pins have been set again in init_config_peripherals()
+void release_off_state_holds()
+{
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)EN_LDO);
+    gpio_hold_dis((gpio_num_t)EPD_CONTROL);
+    gpio_hold_dis((gpio_num_t)BMV_CS_PIN);
+}
+
+void wait_button1_release()
+{
+    while (digitalRead(BUTTON_1) == LOW)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // debounce
+}
+
+// "Everything off": BLE never started, sensor rail and screen unpowered,
+// chip in deep sleep. Only button 1 wakes it, which reboots through setup().
+[[noreturn]] void enter_off_state()
+{
+    // Sensor rail off, screen off. BMV080 CS low so it cannot back-power the
+    // unpowered sensor through its input pin.
+    digitalWrite(EN_LDO, LOW);
+    digitalWrite(EPD_CONTROL, HIGH);
+    pinMode(BMV_CS_PIN, OUTPUT);
+    digitalWrite(BMV_CS_PIN, LOW);
+
+    // Keep these levels during deep sleep
+    gpio_hold_en((gpio_num_t)EN_LDO);
+    gpio_hold_en((gpio_num_t)EPD_CONTROL);
+    gpio_hold_en((gpio_num_t)BMV_CS_PIN);
+    gpio_deep_sleep_hold_en();
+
+    // A held button would wake the chip again immediately
+    wait_button1_release();
+
+    // Wake when button 1 pulls GPIO0 low
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_1, 0);
+    rtc_gpio_pullup_en((gpio_num_t)BUTTON_1);
+    rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_1);
+
+    esp_deep_sleep_start();
+}
+
 void init_i2c_one()
 {
     Wire1.begin(SDA_PIN1, SCL_PIN1, I2C_FREQ_1);
@@ -71,37 +119,13 @@ void init_ble_config()
 
     NimBLEService *pService = pServer->createService(SERVICE_UUID);
 
-    pCharPM1 = pService->createCharacteristic(
-        UUID_PM1,
+    pCharReadings = pService->createCharacteristic(
+        UUID_READINGS,
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
-    pCharPM25 = pService->createCharacteristic(
-        UUID_PM25,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-
-    pCharPM10 = pService->createCharacteristic(
-        UUID_PM10,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-
-    pCharCO2 = pService->createCharacteristic(
-        UUID_CO2,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-
-    pCharTMP = pService->createCharacteristic(
-        UUID_TEMP,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-
-    pCharHUM = pService->createCharacteristic(
-        UUID_HUM,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-
-    pCharPRESS = pService->createCharacteristic(
-        UUID_PRESS,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-
-    pCharBATT = pService->createCharacteristic(
-        UUID_BATTERY,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    static const char label[] = "Readings v1 (20-byte packed record)";
+    pCharReadings->createDescriptor("2901", NIMBLE_PROPERTY::READ)
+        ->setValue((const uint8_t *)label, strlen(label));
 
     pService->start();
 
@@ -222,63 +246,61 @@ void read_sensors(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
     read_rtc();
 }
 
-int32_t roundedInt32(float value)
+// Scale, round and clamp a float into the packet field; NaN/inf becomes the
+// "no value" marker. Valid values are clamped one below the marker so they
+// can never be mistaken for it.
+static uint16_t packU16(float value, float scale)
 {
     if (isnan(value) || isinf(value))
-    {
-        return 0;
-    }
-
-    return (int32_t)lroundf(value);
+        return NO_VALUE_U16;
+    return (uint16_t)constrain(lroundf(value * scale), 0L, (long)NO_VALUE_U16 - 1);
 }
 
-int32_t batteryPercentForBle(float batteryPercent)
+static int16_t packI16(float value, float scale)
 {
-    return roundedInt32(batteryPercent * 100.0f);
+    if (isnan(value) || isinf(value))
+        return NO_VALUE_I16;
+    return (int16_t)constrain(lroundf(value * scale), (long)NO_VALUE_I16 + 1, (long)INT16_MAX);
 }
 
-void setInt32Value(NimBLECharacteristic *characteristic, int32_t value)
+static uint8_t packU8(float value)
 {
-    characteristic->setValue(reinterpret_cast<const uint8_t *>(&value), sizeof(value));
+    if (isnan(value) || isinf(value))
+        return NO_VALUE_U8;
+    return (uint8_t)constrain(lroundf(value), 0L, (long)NO_VALUE_U8 - 1);
 }
 
+// Calendar date/time -> seconds since 1970-01-01 (days_from_civil algorithm)
+static uint32_t toEpoch(int32_t y, uint32_t m, uint32_t d, uint32_t hh, uint32_t mm, uint32_t ss)
+{
+    y -= m <= 2;
+    const int32_t era = (y >= 0 ? y : y - 399) / 400;
+    const uint32_t yoe = (uint32_t)(y - era * 400);
+    const uint32_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const int32_t days = era * 146097 + (int32_t)doe - 719468;
+    return (uint32_t)days * 86400UL + hh * 3600UL + mm * 60UL + ss;
+}
+
+// Sends one reading as a single 20-byte notification.
+// Time comes from the RTC registers read by read_rtc().
 void send_data_ble()
 {
-    setInt32Value(pCharPM1, roundedInt32(ble_pm1));
-    pCharPM1->notify();
+    reading_packet_t p;
+    p.version = PACKET_VERSION;
+    p.timestamp = toEpoch(rtc.getYear(), rtc.getMonth(), rtc.getDate(),
+                          rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+    p.pm1 = packU16(ble_pm1, 1);
+    p.pm25 = packU16(ble_pm25, 1);
+    p.pm10 = packU16(ble_pm10, 1);
+    p.co2 = packU16(ble_co2, 1);
+    p.temp = packI16(ble_temp, 10);
+    p.hum = packU16(ble_rh, 10);
+    p.pres = packU16(ble_press, 10); // BME690 library reports hPa
+    p.battery = packU8(min(ble_batt, 100.0f)); // Gauge can read slightly above 100 % when full
 
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    setInt32Value(pCharPM25, roundedInt32(ble_pm25));
-    pCharPM25->notify();
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    setInt32Value(pCharPM10, roundedInt32(ble_pm10));
-    pCharPM10->notify();
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    setInt32Value(pCharCO2, static_cast<int32_t>(ble_co2));
-    pCharCO2->notify();
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    setInt32Value(pCharTMP, roundedInt32(ble_temp));
-    pCharTMP->notify();
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    setInt32Value(pCharHUM, roundedInt32(ble_rh));
-    pCharHUM->notify();
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    setInt32Value(pCharPRESS, roundedInt32(ble_press));
-    pCharPRESS->notify();
-
-    setInt32Value(pCharBATT, batteryPercentForBle(ble_batt));
-    pCharBATT->notify();
+    pCharReadings->setValue((const uint8_t *)&p, sizeof p); // Also readable on demand
+    pCharReadings->notify();
 }
 
 void stop_sensors()
@@ -319,10 +341,24 @@ void run_sensor_cycle()
 
 void setup()
 {
+    // Button 1 is left in RTC mode after a deep sleep wake-up
+    rtc_gpio_deinit((gpio_num_t)BUTTON_1);
 
     init_config_peripherals();
+    release_off_state_holds();
 
+    // Puts STCC4 and MAX17048 into their sleep modes
     init_i2c_one();
+
+    // Power-on or reset: stay fully off until button 1 is pressed
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0)
+    {
+        enter_off_state();
+    }
+
+    // Woken by button 1. Wait for release so the UI does not see this
+    // press as a second "button 1" action.
+    wait_button1_release();
 
     init_ble_config();
 
