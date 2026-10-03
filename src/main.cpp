@@ -38,6 +38,14 @@ void init_config_peripherals()
     digitalWrite(EN_LDO, LOW);
     digitalWrite(EPD_CONTROL, HIGH);
 
+    // BMV080: the IO/digital supply (connector pins 4/6) is always on, only
+    // the laser/analog rail (pins 11/13) is switched by EN_LDO. Its chip
+    // select must stay HIGH whenever the sensor is not accessed, otherwise
+    // the powered interface can be selected and react to screen SPI traffic.
+    // Keep the pin driven HIGH during light sleep too (the sdkconfig
+    // otherwise disconnects every GPIO while sleeping).
+    gpio_sleep_sel_dis((gpio_num_t)BMV_CS_PIN);
+
     pinMode(BUTTON_1, INPUT_PULLUP);
     vTaskDelay(pdMS_TO_TICKS(200));
 }
@@ -71,12 +79,12 @@ void wait_button1_release()
     gpio_intr_disable((gpio_num_t)BUTTON_1);
     gpio_wakeup_disable((gpio_num_t)BUTTON_1);
 
-    // Sensor rail off, screen off. BMV080 CS low so it cannot back-power the
-    // unpowered sensor through its input pin.
+    // Sensor rail off, screen off. BMV080 CS HIGH (deselected): its IO and
+    // digital supply stays powered from the always-on 3V3 rail.
     digitalWrite(EN_LDO, LOW);
     digitalWrite(EPD_CONTROL, HIGH);
     pinMode(BMV_CS_PIN, OUTPUT);
-    digitalWrite(BMV_CS_PIN, LOW);
+    digitalWrite(BMV_CS_PIN, HIGH);
 
     // Keep these levels during deep sleep
     gpio_hold_en((gpio_num_t)EN_LDO);
@@ -180,9 +188,7 @@ void start_sensors(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
     bmv080.open();
     bmv080.reset();
     bmv080.setMode(SF_BMV080_MODE_CONTINUOUS);
-
-    Wire.begin(SDA_PIN0, SCL_PIN0, I2C_FREQ_0);
-    bme.begin(Wire);
+    // BME690 is started in read_bme690(), only when a reading is due
 }
 
 void read_stcc4()
@@ -217,9 +223,59 @@ void read_rtc(){
 // covers the full window.
 constexpr float BMV080_INTEGRATION_S = 10.0f;
 constexpr uint32_t BMV080_MAX_MEASURE_MS = 15000; // give up if no full-window output
-constexpr uint32_t BME690_READ_WINDOW_MS = 2000;  // BME690 read as before (first 2 s)
 
-void read_air_and_bme(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
+// Time of the last successful BME690 reading (0 = none yet since wake-up)
+static bool bme690HasReading = false;
+static uint32_t lastBme690Ms = 0;
+
+bool bme690_reading_due()
+{
+    return !bme690HasReading || millis() - lastBme690Ms >= BME690_PERIOD_MS;
+}
+
+// The 7semi library always enables the gas heater (300 C) in begin(); clear
+// run_gas so a reading does not heat the sensor. The gas value is not used.
+void disable_bme690_gas_heater()
+{
+    Wire.beginTransmission(BME690_ADDR);
+    Wire.write(BME690_REG_CTRL_GAS_1);
+    Wire.endTransmission(false);
+    Wire.requestFrom(BME690_ADDR, (uint8_t)1);
+    const uint8_t ctrl = Wire.available() ? Wire.read() : 0;
+
+    Wire.beginTransmission(BME690_ADDR);
+    Wire.write(BME690_REG_CTRL_GAS_1);
+    Wire.write(ctrl & ~BME690_RUN_GAS_MSK);
+    Wire.endTransmission();
+}
+
+// One forced measurement (no heater). On failure the previous values are kept
+// and a new attempt is made on the next sensor cycle.
+void read_bme690(BME690_7semi &bme)
+{
+    Wire.begin(SDA_PIN0, SCL_PIN0, I2C_FREQ_0);
+    if (!bme.begin(Wire))
+    {
+        return;
+    }
+    disable_bme690_gas_heater();
+
+    for (uint8_t attempt = 0; attempt < 3; attempt++)
+    {
+        if (bme.readSensorData())
+        {
+            ble_temp = bme.getTemperature();
+            ble_rh = bme.getHumidity();
+            ble_press = bme.getPressure();
+            bme690HasReading = true;
+            lastBme690Ms = millis();
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+void read_bmv080(SparkFunBMV080SPI &bmv080)
 {
     // Sent as "no value" if the BMV080 gives no usable output this cycle
     ble_pm1 = ble_pm25 = ble_pm10 = NAN;
@@ -249,13 +305,6 @@ void read_air_and_bme(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
             }
         }
 
-        if (millis() - startMs < BME690_READ_WINDOW_MS && bme.readSensorData())
-        {
-            ble_temp = bme.getTemperature();
-            ble_rh = bme.getHumidity();
-            ble_press = bme.getPressure();
-        }
-
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -263,7 +312,14 @@ void read_air_and_bme(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
 void read_sensors(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
 {
     read_stcc4();
-    read_air_and_bme(bmv080, bme);
+
+    // Before the BMV080 measurement, while the board is still cool
+    if (bme690_reading_due())
+    {
+        read_bme690(bme);
+    }
+
+    read_bmv080(bmv080);
     read_max();
     read_rtc();
 }
@@ -332,7 +388,10 @@ void stop_sensors()
     pinMode(MOSI_PIN, INPUT);
     pinMode(SCK_PIN, INPUT);
     pinMode(MISO_PIN, INPUT);
-    pinMode(BMV_CS_PIN, INPUT);
+
+    // Keep the BMV080 deselected between cycles (its IO side stays powered)
+    pinMode(BMV_CS_PIN, OUTPUT);
+    digitalWrite(BMV_CS_PIN, HIGH);
 
     control_sensor_power(false);
 }

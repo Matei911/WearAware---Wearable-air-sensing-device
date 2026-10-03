@@ -34,9 +34,10 @@ NimBLECharacteristic *pCharReadings = nullptr;
 float ble_pm1 = 0.0;
 float ble_pm25 = 0.0;
 float ble_pm10 = 0.0;
-float ble_temp = 0.0;
-float ble_rh = 0.0;
-float ble_press = 0.0;
+// NaN until the first BME690 reading -> sent as "no value"
+float ble_temp = NAN;
+float ble_rh = NAN;
+float ble_press = NAN;
 float ble_batt = 0.0;
 int16_t ble_co2 = 0;
 
@@ -111,6 +112,13 @@ constexpr uint8_t BUTTON_3 = 33;
 
 // Sensor cycle period while a phone is connected
 constexpr uint32_t SENSOR_PERIOD_MS = 60000;
+
+// BME690: read only every 5 minutes to limit self-heating; every sensor cycle
+// in between sends the last temperature / humidity / pressure again
+constexpr uint32_t BME690_PERIOD_MS = 5UL * 60UL * 1000UL;
+constexpr uint8_t BME690_ADDR = 0x76;
+constexpr uint8_t BME690_REG_CTRL_GAS_1 = 0x71; // run_gas bits enable the gas heater
+constexpr uint8_t BME690_RUN_GAS_MSK = 0x30;
 
 // STCC4, MAX, RTC CONFIG
 SensirionI2cStcc4 stcc4;
