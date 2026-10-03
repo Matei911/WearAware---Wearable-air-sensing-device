@@ -65,6 +65,12 @@ void wait_button1_release()
 // chip in deep sleep. Only button 1 wakes it, which reboots through setup().
 [[noreturn]] void enter_off_state()
 {
+    // Only button 1 may wake the chip: drop the light-sleep GPIO wake-up and
+    // the button interrupt used while running
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    gpio_intr_disable((gpio_num_t)BUTTON_1);
+    gpio_wakeup_disable((gpio_num_t)BUTTON_1);
+
     // Sensor rail off, screen off. BMV080 CS low so it cannot back-power the
     // unpowered sensor through its input pin.
     digitalWrite(EN_LDO, LOW);
@@ -205,29 +211,45 @@ void read_rtc(){
     rtc.updateTime();
 }
 
+// The BMV080 outputs a result every second, averaged over its integration
+// time (10 s by default). Results from the first seconds after power-up come
+// from a nearly empty window and read ~0, so keep measuring until an output
+// covers the full window.
+constexpr float BMV080_INTEGRATION_S = 10.0f;
+constexpr uint32_t BMV080_MAX_MEASURE_MS = 15000; // give up if no full-window output
+constexpr uint32_t BME690_READ_WINDOW_MS = 2000;  // BME690 read as before (first 2 s)
+
 void read_air_and_bme(SparkFunBMV080SPI &bmv080, BME690_7semi &bme)
 {
+    // Sent as "no value" if the BMV080 gives no usable output this cycle
+    ble_pm1 = ble_pm25 = ble_pm10 = NAN;
+
     const uint32_t startMs = millis();
 
-    while (millis() - startMs < 2000)
+    while (millis() - startMs < BMV080_MAX_MEASURE_MS)
     {
-        bool bmvOk = bmv080.readSensor();
-        bool bmeOk = bme.readSensorData();
-
-        if (bmvOk)
+        // Must be served at least once per second while measuring
+        bmv080_output_t out;
+        if (bmv080.readSensor(&out))
         {
-            ble_pm10 = bmv080.PM10();
-            ble_pm25 = bmv080.PM25();
-            ble_pm1 = bmv080.PM1();
-        }
-        else if (bmv080.isObstructed())
-        {
-            ble_pm10 = 0.0f;
-            ble_pm25 = 0.0f;
-            ble_pm1 = 0.0f;
+            if (out.is_obstructed)
+            {
+                ble_pm1 = ble_pm25 = ble_pm10 = NAN;
+            }
+            else
+            {
+                ble_pm1 = out.pm1_mass_concentration;
+                ble_pm25 = out.pm2_5_mass_concentration;
+                ble_pm10 = out.pm10_mass_concentration;
+            }
+
+            if (out.runtime_in_sec >= BMV080_INTEGRATION_S)
+            {
+                break; // full integration window: final value for this cycle
+            }
         }
 
-        if (bmeOk)
+        if (millis() - startMs < BME690_READ_WINDOW_MS && bme.readSensorData())
         {
             ble_temp = bme.getTemperature();
             ble_rh = bme.getHumidity();
@@ -350,10 +372,11 @@ void setup()
     // Puts STCC4 and MAX17048 into their sleep modes
     init_i2c_one();
 
-    // Power-on or reset: stay fully off until button 1 is pressed
+    // Power-on or reset: show "Bluetooth off", then stay fully off until
+    // button 1 is pressed
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0)
     {
-        enter_off_state();
+        ui_power_off();
     }
 
     // Woken by button 1. Wait for release so the UI does not see this

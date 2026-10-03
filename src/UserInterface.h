@@ -2,10 +2,12 @@
 // WearAware e-paper user interface (200x200 B/W, GDEY0154D67)
 //
 // Screens:
-//   PAIRING     - advertising, shows how to connect from the phone
-//   CONNECTED   - "BLE connected, check your phone"
+//   BLE_OFF     - shown at power-on and when the user turns Bluetooth off.
+//                 The device then enters deep sleep (everything off) and
+//                 only button 1 wakes it, straight into PAIRING.
+//   PAIRING     - advertising, shows how to connect. B1 = Bluetooth off
+//   CONNECTED   - "BLE connected, check your phone". B1 asks to disconnect
 //   CONFIRM     - "Disconnect phone?" (B2 = yes, B3 = no, times out)
-//   BLE_OFF     - user turned Bluetooth off, B1 turns it back on
 //
 // Power strategy:
 //   - The screen is only redrawn when the screen state changes. Between
@@ -56,6 +58,9 @@ static QueueHandle_t uiEventQueue = nullptr;
 static UiScreen uiCurrentScreen = SCREEN_NONE;
 static esp_pm_lock_handle_t uiNoSleepLock = nullptr;
 static esp_pm_lock_handle_t uiApbLock = nullptr;
+
+// Implemented in main.cpp: deep sleep with everything off, wake on button 1
+[[noreturn]] void enter_off_state();
 
 // ---------------------------------------------------------------------------
 // Events
@@ -259,8 +264,8 @@ static void draw_screen_ble_off()
     draw_header(false);
     draw_big_icon(ble_off);
     print_centered("Bluetooth off", 122, &FreeSansBold12pt7b);
-    print_centered("Phone disconnected", 150, &FreeSans9pt7b);
-    draw_footer("B1: Pair again");
+    print_centered("Press B1 to connect", 150, &FreeSans9pt7b);
+    draw_footer("B1: Connect phone");
 }
 
 static void ui_render(UiScreen screen)
@@ -270,9 +275,13 @@ static void ui_render(UiScreen screen)
         return;
     }
 
-    // Keep the CPU awake and APB at full speed while SPI + BUSY waits run
-    esp_pm_lock_acquire(uiNoSleepLock);
-    esp_pm_lock_acquire(uiApbLock);
+    // Keep the CPU awake and APB at full speed while SPI + BUSY waits run.
+    // The locks do not exist yet when the power-on screen is drawn.
+    if (uiNoSleepLock != nullptr)
+    {
+        esp_pm_lock_acquire(uiNoSleepLock);
+        esp_pm_lock_acquire(uiApbLock);
+    }
 
     epd_power_on();
 
@@ -302,8 +311,11 @@ static void ui_render(UiScreen screen)
 
     epd_power_off();
 
-    esp_pm_lock_release(uiApbLock);
-    esp_pm_lock_release(uiNoSleepLock);
+    if (uiNoSleepLock != nullptr)
+    {
+        esp_pm_lock_release(uiApbLock);
+        esp_pm_lock_release(uiNoSleepLock);
+    }
 
     uiCurrentScreen = screen;
 }
@@ -325,6 +337,14 @@ static UiScreen ui_target_screen()
 void ui_sync_screen()
 {
     ui_render(ui_target_screen());
+}
+
+// Shows "Bluetooth off" and powers everything down (deep sleep).
+// Button 1 wakes the device, which then restarts into pairing.
+[[noreturn]] void ui_power_off()
+{
+    ui_render(SCREEN_BLE_OFF);
+    enter_off_state();
 }
 
 static void ble_disconnect_by_user()
@@ -417,12 +437,14 @@ static void ui_handle_button1()
         if (ui_ask_disconnect())
         {
             ble_disconnect_by_user();
+            ui_power_off();
         }
         break;
 
     case SCREEN_PAIRING:
         bleUserDisabled = true;
         NimBLEDevice::stopAdvertising();
+        ui_power_off();
         break;
 
     case SCREEN_BLE_OFF:
