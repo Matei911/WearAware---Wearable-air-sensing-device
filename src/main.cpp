@@ -171,7 +171,7 @@ void control_sensor_power(bool on_off)
 
 // Sets up the SPI bus and prepares the BMV080 (driver open + reset like the
 // SparkFun example, then the measurement parameters). The measurement itself
-// is only started in read_bmv080(), right before it is served.
+// is only started in bmv080_start(), right before it is served.
 // Returns false if the BMV080 could not be prepared.
 bool start_sensors(SparkFunBMV080SPI &bmv080)
 {
@@ -198,19 +198,68 @@ bool start_sensors(SparkFunBMV080SPI &bmv080)
            bmv080.setMeasurementAlgorithm(BMV080_ALGORITHM);
 }
 
-void read_stcc4()
+// ==================== STCC4 (CO2) ====================
+
+// Continuous CO2 readings collected during one window
+struct Co2Burst
 {
-    uint16_t status = 0;
-    float stccTemp = 0.0f;
-    float stccRh = 0.0f;
+    bool running = false;
+    uint8_t readings = 0; // successful reads, settling ones included
+    uint8_t summed = 0;   // reads after the first CO2_SETTLE_READINGS
+    float sum = 0.0f;
+    uint32_t nextReadMs = 0;
+};
 
+// Wakes the STCC4 and starts 1 s continuous measurements
+static void stcc4_start(Co2Burst &co2)
+{
     stcc4.exitSleepMode();
+    co2.running = stcc4.startContinuousMeasurement() == 0;
+    // The first result is ready one measurement interval after the start
+    co2.nextReadMs = millis() + STCC4_READ_INTERVAL_MS + MEASURE_POLL_MS;
+}
 
-    stcc4.measureSingleShot();
+static void stcc4_poll(Co2Burst &co2)
+{
+    if (!co2.running || (int32_t)(millis() - co2.nextReadMs) < 0)
+    {
+        return;
+    }
+    // Spaced from the actual read, so a late poll (e.g. after the BME690)
+    // does not read the same result twice
+    co2.nextReadMs = millis() + STCC4_READ_INTERVAL_MS;
 
-    stcc4.readMeasurement(ble_co2, stccTemp, stccRh, status);
+    int16_t ppm = 0;
+    float shtTemp = 0.0f;
+    float shtRh = 0.0f;
+    uint16_t status = 0;
+    if (stcc4.readMeasurement(ppm, shtTemp, shtRh, status) != 0)
+    {
+        return;
+    }
 
+    DEBUG_LOG("co2 #%u: %d ppm (SHT45 %.1f C, %.1f %%RH)\n", co2.readings, ppm, shtTemp, shtRh);
+    if (co2.readings++ >= CO2_SETTLE_READINGS)
+    {
+        co2.sum += ppm;
+        co2.summed++;
+    }
+}
+
+// Puts the STCC4 back to sleep and returns the window's mean CO2 (NaN if
+// none). stop_continuous_measurement blocks for 1.2 s, so this runs only once
+// the BMV080 no longer needs serving.
+static float stcc4_finish(Co2Burst &co2)
+{
+    if (!co2.running)
+    {
+        return NAN;
+    }
+
+    stcc4.stopContinuousMeasurement();
     stcc4.enterSleepMode();
+
+    return co2.summed > 0 ? co2.sum / co2.summed : NAN;
 }
 
 void read_max()
@@ -276,58 +325,158 @@ void read_bme690(BME690_7semi &bme)
     }
 }
 
+// ==================== BMV080 (PM) ====================
+
+// Full-window outputs collected during one window
+struct PmBurst
+{
+    bool running = false;
+    uint8_t count = 0;
+    float pm1[BMV080_MAX_OUTPUTS];
+    float pm25[BMV080_MAX_OUTPUTS];
+    float pm10[BMV080_MAX_OUTPUTS];
+};
+
+// Median of n values (sorts them in place), NaN if there are none
+static float median(float *v, uint8_t n)
+{
+    if (n == 0)
+    {
+        return NAN;
+    }
+    for (uint8_t i = 1; i < n; i++)
+    {
+        const float x = v[i];
+        uint8_t j = i;
+        while (j > 0 && v[j - 1] > x)
+        {
+            v[j] = v[j - 1];
+            j--;
+        }
+        v[j] = x;
+    }
+    return (n % 2) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0f;
+}
+
+static void bmv080_start(SparkFunBMV080SPI &bmv080, bool ready, PmBurst &pm)
+{
+    pm.running = ready && bmv080.setMode(SF_BMV080_MODE_CONTINUOUS);
+}
+
 // The BMV080 outputs a result every second, computed over the last
 // BMV080_INTEGRATION_S seconds. Outputs from the first seconds of a burst
-// cover a partly empty window and read too low, so only the first output that
-// covers the full window is used. Nothing else runs while measuring, so the
-// sensor is served every 100 ms (Bosch: at least once per second).
-void read_bmv080(SparkFunBMV080SPI &bmv080, bool ready)
+// cover a partly empty window and read too low; obstructed ones are invalid.
+static void bmv080_poll(SparkFunBMV080SPI &bmv080, PmBurst &pm)
 {
-    // Sent as "no value" unless a full-window, unobstructed output arrives
-    ble_pm1 = ble_pm25 = ble_pm10 = NAN;
-
-    if (!ready || !bmv080.setMode(SF_BMV080_MODE_CONTINUOUS))
+    bmv080_output_t out;
+    if (!pm.running || !bmv080.readSensor(&out))
     {
         return;
     }
 
-    const uint32_t startMs = millis();
+    DEBUG_LOG("pm  %4.1f s: %.1f / %.1f / %.1f ug/m3%s\n", out.runtime_in_sec,
+              out.pm1_mass_concentration, out.pm2_5_mass_concentration,
+              out.pm10_mass_concentration, out.is_obstructed ? " obstructed" : "");
 
-    while (millis() - startMs < BMV080_MAX_MEASURE_MS)
+    if (out.runtime_in_sec < BMV080_INTEGRATION_S || out.is_obstructed ||
+        pm.count >= BMV080_MAX_OUTPUTS)
     {
-        bmv080_output_t out;
-        if (bmv080.readSensor(&out) && out.runtime_in_sec >= BMV080_INTEGRATION_S)
-        {
-            if (!out.is_obstructed)
-            {
-                ble_pm1 = out.pm1_mass_concentration;
-                ble_pm25 = out.pm2_5_mass_concentration;
-                ble_pm10 = out.pm10_mass_concentration;
-            }
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        return;
     }
-
-    // End the measurement before the laser rail is switched off. The SparkFun
-    // wrapper has no stop call; a reset returns the BMV080 to idle.
-    bmv080.reset();
+    pm.pm1[pm.count] = out.pm1_mass_concentration;
+    pm.pm25[pm.count] = out.pm2_5_mass_concentration;
+    pm.pm10[pm.count] = out.pm10_mass_concentration;
+    pm.count++;
 }
 
-void read_sensors(SparkFunBMV080SPI &bmv080, bool bmv080Ready, BME690_7semi &bme)
+// Ends the burst and stores the medians. Sent as "no value" unless at least
+// one full-window, unobstructed output arrived.
+static void bmv080_finish(SparkFunBMV080SPI &bmv080, PmBurst &pm)
 {
-    // CO2 and BME690 first: both block (STCC4 single shot ~0.5 s), and the
-    // BMV080 must not be left unserved once its measurement has started
-    read_stcc4();
-
-    if (bme690_reading_due())
+    if (pm.running)
     {
-        read_bme690(bme);
+        // End the measurement before the laser rail is switched off. The
+        // SparkFun wrapper has no stop call; a reset returns it to idle.
+        bmv080.reset();
     }
 
-    read_bmv080(bmv080, bmv080Ready);
-    read_max();
-    read_rtc();
+    // Per-channel medians keep PM1 <= PM2.5 <= PM10, as every output does
+    ble_pm1 = median(pm.pm1, pm.count);
+    ble_pm25 = median(pm.pm25, pm.count);
+    ble_pm10 = median(pm.pm10, pm.count);
+}
+
+// ==================== Schedule (RTC-aligned) ====================
+//
+// A cycle starts MEASURE_WINDOW_MS before every RTC minute, so its
+// notification goes out at hh:mm:00. Between cycles millis() keeps time (it
+// runs through light sleep from the 32 kHz crystal) and the RV-3028 gives the
+// phase. The RV-3028 has no sub-second register, so the phase is taken from
+// the moment its seconds counter ticks over, caught inside every measurement
+// window where the CPU is awake anyway.
+
+// millis() at which some RTC minute started (only the phase matters)
+static uint32_t rtcMinuteStartMs = 0;
+
+// Rough phase (+-1 s) from a single read, used until a window refines it.
+// Without a readable RTC the cycles still run every minute, just unaligned.
+void rtc_phase_coarse()
+{
+    rtcMinuteStartMs = millis();
+    if (rtc.updateTime())
+    {
+        rtcMinuteStartMs -= rtc.getSeconds() * 1000UL;
+    }
+}
+
+// Watches for the RTC seconds counter to tick over
+struct RtcEdge
+{
+    bool found = false;
+    int8_t lastSeconds = -1; // -1 = not read yet
+};
+
+static void rtc_phase_poll(RtcEdge &edge)
+{
+    if (edge.found || !rtc.updateTime())
+    {
+        return;
+    }
+    const uint8_t seconds = rtc.getSeconds();
+    if (edge.lastSeconds >= 0 && seconds != edge.lastSeconds)
+    {
+        rtcMinuteStartMs = millis() - seconds * 1000UL;
+        edge.found = true;
+    }
+    edge.lastSeconds = seconds;
+}
+
+// Start of the first cycle after afterMs
+uint32_t next_cycle_start(uint32_t afterMs)
+{
+    // rtcMinuteStartMs lies in the past, so this slot is not after afterMs:
+    // step forward whole periods (unsigned math also covers the millis() wrap)
+    uint32_t slotMs = rtcMinuteStartMs - MEASURE_WINDOW_MS;
+    slotMs += ((afterMs - slotMs) / SENSOR_PERIOD_MS + 1) * SENSOR_PERIOD_MS;
+    return slotMs;
+}
+
+// ==================== Measurement window ====================
+
+// Serves the BMV080 every MEASURE_POLL_MS (Bosch: at least once per second),
+// reads the STCC4 once per second and catches the RTC tick for the schedule,
+// until endMs. Nothing in here blocks for long.
+static void measure_window(SparkFunBMV080SPI &bmv080, PmBurst &pm, Co2Burst &co2,
+                           uint32_t endMs)
+{
+    RtcEdge edge;
+    while ((int32_t)(endMs - millis()) > 0)
+    {
+        bmv080_poll(bmv080, pm);
+        stcc4_poll(co2);
+        rtc_phase_poll(edge);
+        vTaskDelay(pdMS_TO_TICKS(MEASURE_POLL_MS));
+    }
 }
 
 // Scale, round and clamp a float into the packet field; NaN/inf becomes the
@@ -372,8 +521,11 @@ void send_data_ble()
 {
     reading_packet_t p;
     p.version = PACKET_VERSION;
-    p.timestamp = toEpoch(rtc.getYear(), rtc.getMonth(), rtc.getDate(),
-                          rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+    // The window ends on an RTC minute; rounding removes the second or so of
+    // jitter around it, so every reading is stamped hh:mm:00
+    const uint32_t nowEpoch = toEpoch(rtc.getYear(), rtc.getMonth(), rtc.getDate(),
+                                      rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+    p.timestamp = (nowEpoch + 30) / 60 * 60;
     p.pm1 = packU16(ble_pm1, 1);
     p.pm25 = packU16(ble_pm25, 1);
     p.pm10 = packU16(ble_pm10, 1);
@@ -402,23 +554,48 @@ void stop_sensors()
     control_sensor_power(false);
 }
 
+// One MEASURE_WINDOW_MS cycle: all sensors measure together, then one
+// notification is sent
 void run_sensor_cycle()
 {
+    const uint32_t startMs = millis();
     SparkFunBMV080SPI bmv080;
     BME690_7semi bme(0x76, BME690_7semi::MODE_I2C);
+    PmBurst pm;
+    Co2Burst co2;
 
     esp_pm_lock_acquire(sensorNoSleepLock);
     esp_pm_lock_acquire(sensorApbLock);
+
+    // CO2 first: every second of the window is one more STCC4 sample
+    stcc4_start(co2);
 
     control_sensor_power(true);
 
     const bool bmv080Ready = start_sensors(bmv080);
 
-    read_sensors(bmv080, bmv080Ready, bme);
+    // Blocking, so before the BMV080 measurement starts (from then on it must
+    // be served every second)
+    if (bme690_reading_due())
+    {
+        read_bme690(bme);
+    }
+
+    bmv080_start(bmv080, bmv080Ready, pm);
+    measure_window(bmv080, pm, co2, startMs + MEASURE_WINDOW_MS - MEASURE_TEARDOWN_MS);
+    bmv080_finish(bmv080, pm);
 
     bmv080.close();
 
     stop_sensors();
+
+    ble_co2 = stcc4_finish(co2); // blocks 1.2 s, the BMV080 is off by now
+    read_max();
+    read_rtc();
+
+    DEBUG_LOG("cycle %lu ms: co2 %u of %u readings -> %.0f ppm, pm %u outputs -> %.1f / %.1f / %.1f\n",
+              (unsigned long)(millis() - startMs), co2.summed, co2.readings, ble_co2,
+              pm.count, ble_pm1, ble_pm25, ble_pm10);
 
     send_data_ble();
 
@@ -428,6 +605,10 @@ void run_sensor_cycle()
 
 void setup()
 {
+#if WEARAWARE_DEBUG_LOG
+    Serial.begin(115200);
+#endif
+
     // Button 1 is left in RTC mode after a deep sleep wake-up
     rtc_gpio_deinit((gpio_num_t)BUTTON_1);
 
@@ -466,30 +647,42 @@ void setup()
 
 void loop()
 {
-    static bool cycleDoneThisConnection = false;
-    static uint32_t lastCycleMs = 0;
+    static bool cycleScheduled = false;
+    static uint32_t nextCycleMs = 0;
 
     // Button presses / BLE changes that arrived meanwhile + screen update
     ui_process_events();
 
     if (!deviceConnected)
     {
-        cycleDoneThisConnection = false;
+        cycleScheduled = false;
         // Light sleep until a button press or BLE connect wakes us
         ui_wait_for_event(SENSOR_PERIOD_MS);
         return;
     }
 
-    // First cycle right after connecting, then every SENSOR_PERIOD_MS
-    const uint32_t sinceLast = millis() - lastCycleMs;
-    if (!cycleDoneThisConnection || sinceLast >= SENSOR_PERIOD_MS)
+    if (!cycleScheduled)
     {
-        run_sensor_cycle();
-        lastCycleMs = millis();
-        cycleDoneThisConnection = true;
+        // Just connected: phase from the RTC, first cycle at the next
+        // RTC-aligned slot
+        rtc_phase_coarse();
+        nextCycleMs = next_cycle_start(millis());
+        cycleScheduled = true;
+    }
+
+    const int32_t untilNextMs = (int32_t)(nextCycleMs - millis());
+    if (untilNextMs > 0)
+    {
+        // Light sleep until the next cycle, or earlier if button 1 is pressed
+        ui_wait_for_event((uint32_t)untilNextMs);
         return;
     }
 
-    // Light sleep until the next cycle, or earlier if button 1 is pressed
-    ui_wait_for_event(SENSOR_PERIOD_MS - sinceLast);
+    // Fixed rate: the next slot follows from the RTC phase, not from when
+    // this cycle ends. A slot missed by too much is skipped.
+    if ((uint32_t)(-untilNextMs) <= CYCLE_MAX_LATE_MS)
+    {
+        run_sensor_cycle();
+    }
+    nextCycleMs = next_cycle_start(millis());
 }

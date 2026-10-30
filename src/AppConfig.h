@@ -40,7 +40,8 @@ float ble_temp = NAN;
 float ble_rh = NAN;
 float ble_press = NAN;
 float ble_batt = 0.0;
-int16_t ble_co2 = 0;
+// NaN when the STCC4 has no valid reading
+float ble_co2 = NAN;
 
 // BLE: one custom service with ONE read/notify characteristic that carries a
 // whole reading as a packed 20-byte binary record (see reading_packet_t).
@@ -55,7 +56,8 @@ int16_t ble_co2 = 0;
 //
 //  off size field     type    scale  "no value"
 //   0   1   version   uint8   -      (always PACKET_VERSION)
-//   1   4   timestamp uint32  -      0            seconds since 1970-01-01, RTC local time
+//   1   4   timestamp uint32  -      0            seconds since 1970-01-01, RTC local time,
+//                                                  rounded to the minute (always hh:mm:00)
 //   5   2   pm1       uint16  1      0xFFFF       ug/m3
 //   7   2   pm25      uint16  1      0xFFFF       ug/m3
 //   9   2   pm10      uint16  1      0xFFFF       ug/m3
@@ -111,12 +113,29 @@ constexpr uint8_t BUTTON_1 = 0;
 constexpr uint8_t BUTTON_2 = 34;
 constexpr uint8_t BUTTON_3 = 33;
 
-// Sensor cycle period while a phone is connected
+// ==================== Measurement cycle ====================
+//
+// While a phone is connected the device measures once per RTC minute:
+//
+//   hh:mm:45   wake, STCC4 continuous + BMV080 burst
+//   hh:mm:58   measuring ends, sensors off
+//   hh:mm+1:00 notification, timestamped with that whole minute
+//   then light sleep until the next :45
+//
+// Cycles run at a fixed rate locked to the RTC, so the time spent measuring
+// never pushes the next cycle later.
 constexpr uint32_t SENSOR_PERIOD_MS = 60000;
+constexpr uint32_t MEASURE_WINDOW_MS = 15000;  // wake -> notification
+constexpr uint32_t MEASURE_TEARDOWN_MS = 2000; // STCC4 stop (1.2 s) + rail off + notify
+constexpr uint32_t MEASURE_POLL_MS = 100;      // window loop tick
+// A cycle that cannot start within this time of its slot (e.g. the user was in
+// the disconnect dialog) is skipped, so a reading never lands in the wrong minute
+constexpr uint32_t CYCLE_MAX_LATE_MS = 20000;
 
 // BMV080: measured in a burst each sensor cycle (laser rail on, measure,
-// laser rail off). The value sent is the first driver output that covers a
-// full integration window; partial-window outputs are not used.
+// laser rail off). Every driver output that covers a full integration window
+// is kept (about 3 per cycle) and the median is sent; partial-window outputs
+// read too low and are not used.
 //   BMV080_INTEGRATION_S : measurement window. Longer = less noise, more power.
 //   BMV080_ALGORITHM     : FAST_RESPONSE is what Bosch's own duty-cycling
 //                          (short on/off bursts) mode uses. HIGH_PRECISION is
@@ -124,7 +143,15 @@ constexpr uint32_t SENSOR_PERIOD_MS = 60000;
 //                          to keep running. BALANCED is in between.
 constexpr float BMV080_INTEGRATION_S = 10.0f;
 constexpr uint8_t BMV080_ALGORITHM = E_BMV080_MEASUREMENT_ALGORITHM_FAST_RESPONSE;
-constexpr uint32_t BMV080_MAX_MEASURE_MS = 15000; // give up without a full window
+constexpr uint8_t BMV080_MAX_OUTPUTS = 8; // full-window outputs kept per cycle
+
+// STCC4 (CO2): an SHT45 on its own sensor bus provides RH/T compensation.
+// It runs in continuous mode (one reading per second) for the whole window
+// instead of a single shot: its internal filtering works per sample, so more
+// samples per minute make it follow CO2 changes much faster. The first
+// readings after waking are dropped, the rest averaged.
+constexpr uint32_t STCC4_READ_INTERVAL_MS = 1000;
+constexpr uint8_t CO2_SETTLE_READINGS = 2;
 
 // BME690: read only every 5 minutes to limit self-heating; every sensor cycle
 // in between sends the last temperature / humidity / pressure again
@@ -132,6 +159,21 @@ constexpr uint32_t BME690_PERIOD_MS = 5UL * 60UL * 1000UL;
 constexpr uint8_t BME690_ADDR = 0x76;
 constexpr uint8_t BME690_REG_CTRL_GAS_1 = 0x71; // run_gas bits enable the gas heater
 constexpr uint8_t BME690_RUN_GAS_MSK = 0x30;
+
+// Set to 1 (here or with -D WEARAWARE_DEBUG_LOG=1 in build_flags) to print
+// every cycle's raw readings on the USB serial port, e.g. to tune
+// CO2_SETTLE_READINGS on the bench
+#ifndef WEARAWARE_DEBUG_LOG
+#define WEARAWARE_DEBUG_LOG 0
+#endif
+#if WEARAWARE_DEBUG_LOG
+#define DEBUG_LOG(...) Serial.printf(__VA_ARGS__)
+#else
+#define DEBUG_LOG(...) \
+    do                 \
+    {                  \
+    } while (0)
+#endif
 
 // STCC4, MAX, RTC CONFIG
 SensirionI2cStcc4 stcc4;
