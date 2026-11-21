@@ -46,8 +46,9 @@ The firmware is intended to provide a clear starting point for understanding the
 2. Install the PlatformIO extension.
 3. Clone this repository.
 4. Open the project directory in PlatformIO.
-5. Connect the WearAware device through USB-C.
-6. Build and upload the firmware.
+5. Follow the installation guide of the Bosch BMV080 SDK found at https://github.com/sparkfun/SparkFun_BMV080_Arduino_Library
+6. Connect the WearAware device through USB-C.
+7. Build and upload the firmware.
 
 Further documentation on firmware structure, BLE characteristics, hardware setup, and operation will be added as the project develops.
 
