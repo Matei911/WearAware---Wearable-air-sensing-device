@@ -2,7 +2,7 @@
 
 | Dependency | Version | License (SPDX) | Redistributed in this repo | Source |
 |---|---|---|---|---|
-| Bosch BMV080 SDK (`lib_bmv080.a`, `lib_postProcessor.a`, `bmv080.h`, `bmv080_defs.h`) | vX.Y.Z | Proprietary (Bosch Sensortec BMV080 SDK License Terms and Conditions) | **No** – must be downloaded from Bosch Sensortec after accepting the license | https://www.bosch-sensortec.com/software-tools/software/previous-sdk-bmv-080-versions/ |
+| Bosch BMV080 SDK (`lib_bmv080.a`, `lib_postProcessor.a`, `bmv080.h`, `bmv080_defs.h`) | vX.Y.Z | Proprietary (Bosch Sensortec BMV080 SDK License Terms and Conditions) | **No** – must be downloaded from Bosch Sensortec after accepting the license | https://www.bosch-sensortec.com/en/software-tools/software/previous-sdk-bmv-080-versions/ |
 | SparkFun BMV080 Arduino Library | 1.0.4 | MIT | No (fetched by PlatformIO) | https://github.com/sparkfun/SparkFun_BMV080_Arduino_Library |
 | SparkFun Toolkit | 1.2.1 | MIT | No (fetched by PlatformIO) | https://github.com/sparkfun/SparkFun_Toolkit |
 | NimBLE-Arduino | 1.4.x | Apache-2.0 | No (fetched by PlatformIO) | https://github.com/h2zero/NimBLE-Arduino |
