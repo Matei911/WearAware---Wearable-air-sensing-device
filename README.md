@@ -46,7 +46,13 @@ The firmware is intended to provide a clear starting point for understanding the
 2. Install the PlatformIO extension.
 3. Clone this repository.
 4. Open the project directory in PlatformIO.
-5. Follow the installation guide of the Bosch BMV080 SDK found at https://github.com/sparkfun/SparkFun_BMV080_Arduino_Library
+5. Download the **Bosch BMV080 SDK v11.2.0** from
+   https://www.bosch-sensortec.com/en/software-tools/software/previous-sdk-bmv-080-versions/
+   and accept Bosch's license terms. Build the project once so PlatformIO downloads the SparkFun library
+   (the build will fail at this point), then copy these SDK files for the ESP32-S3 into
+   `.pio/libdeps/esp32s3/SparkFun BMV080 Arduino Library/src/esp32s3/`:
+   `lib_bmv080.a`, `lib_postProcessor.a`, `bmv080.h`, `bmv080_defs.h`
+   (see the SparkFun library README for the exact source folder inside the SDK).
 6. Connect the WearAware device through USB-C.
 7. Build and upload the firmware.
 
@@ -58,4 +64,9 @@ The repository contains the PlatformIO project files required to build and progr
 
 ## License
 
-Hardware and software licensing information is provided in the repository.
+## License
+
+- **Firmware** (author-written source code and build configuration): MIT License, see [`LICENSE`](LICENSE).
+- **Hardware design files**: CERN Open Hardware Licence v2 – Permissive (CERN-OHL-P-2.0).
+- **Third-party dependencies** keep their own licenses, see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- **Bosch BMV080 SDK** is proprietary and is **not** included in this repository. It must be downloaded from Bosch Sensortec by each user, who must accept Bosch's license terms.
